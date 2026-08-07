@@ -47,7 +47,10 @@ CHART_COLORS = [
     "#9C27B0", "#00BCD4", "#E91E63", "#8BC34A",
 ]
 
-CONFIG_FILE = "migration_config.json"
+APP_DIR = Path(__file__).parent.resolve()
+CONFIG_FILE = str(APP_DIR / "migration_config.json")
+LOGO_DARK = str(APP_DIR / "assets" / "logos" / "ta_logo_dark.svg")
+LOGO_LIGHT = str(APP_DIR / "assets" / "logos" / "ta_logo_light.svg")
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -191,7 +194,7 @@ st.markdown(f"""
 
 # ─── Sidebar Branding ────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("assets/logos/ta_logo_dark.svg", width=140)
+    st.image(LOGO_DARK, width=140)
     st.markdown("---")
     st.markdown(f"""
     <p style="color:{_sb_text}; font-size:13px;">
@@ -207,7 +210,7 @@ with st.sidebar:
 
 # ─── Header ──────────────────────────────────────────────────────────────────
 def render_header(title: str):
-    logo = "assets/logos/ta_logo_dark.svg" if IS_DARK else "assets/logos/ta_logo_light.svg"
+    logo = LOGO_DARK if IS_DARK else LOGO_LIGHT
     col_logo, col_title = st.columns([1, 5])
     with col_logo:
         st.image(logo, width=120)
