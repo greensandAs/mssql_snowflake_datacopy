@@ -194,7 +194,7 @@ st.markdown(f"""
 
 # ─── Sidebar Branding ────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image(LOGO_DARK, width=140)
+    st.image(LOGO_LIGHT, width=140)
     st.markdown("---")
     st.markdown(f"""
     <p style="color:{_sb_text}; font-size:13px;">
