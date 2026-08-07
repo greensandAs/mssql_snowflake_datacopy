@@ -1,6 +1,6 @@
 """app.py — MSSQL → Snowflake Data Migration Console.
 
-Single-file Streamlit app replicating Tiger Analytics branded design.
+Tiger Analytics branded Streamlit app with dark/light theme support.
 Tabs: Dashboard | Config Manager | Run Migration | Validate
 """
 from __future__ import annotations
@@ -24,71 +24,202 @@ except ImportError:
 import snowflake.connector
 import pyodbc
 
-# ─── Brand Palette ───────────────────────────────────────────────────────────
-ST_ORANGE = "#F15A22"
-ST_NAVY = "#1A1A2E"
-ST_SUCCESS = "#22C55E"
-ST_FAILED = "#EF4444"
-ST_WARN = "#F59E0B"
-ST_BG = "#FFFFFF"
-ST_CARD = "#F8F9FA"
+# ─── Brand Tokens (Tiger Analytics) ─────────────────────────────────────────
+TA_ORANGE = "#F15A22"
+TA_ORANGE_DARK = "#D94E1C"
+TA_NAVY = "#1A1A2E"
+TA_GREY_100 = "#F5F5F5"
+TA_GREY_200 = "#E0E0E0"
+TA_GREY_700 = "#4A4A68"
+TA_TEXT_LIGHT = "#1A1A2E"
+TA_TEXT_DARK = "#E6EDF3"
+TA_DARK_BG = "#0D1117"
+TA_DARK_SURFACE = "#161B22"
+TA_DARK_BORDER = "#2D333B"
+TA_DARK_TEXT_MUTED = "#8B949E"
+
+ST_SUCCESS = "#4CAF50"
+ST_FAILED = "#E53935"
+ST_WARN = "#FF9800"
+
+CHART_COLORS = [
+    "#F15A22", "#2196F3", "#4CAF50", "#FF9800",
+    "#9C27B0", "#00BCD4", "#E91E63", "#8BC34A",
+]
 
 CONFIG_FILE = "migration_config.json"
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="MSSQL → Snowflake Migration",
-    page_icon="❄️",
+    page_title="Tiger Analytics | MSSQL → Snowflake",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# ─── CSS Injection ───────────────────────────────────────────────────────────
+
+# ─── Theme Detection ─────────────────────────────────────────────────────────
+def _is_dark_color(hex_color: str) -> bool:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return False
+    r, g, b = int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16)
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255 < 0.5
+
+
+def get_active_theme() -> str:
+    try:
+        bg = st.get_option("theme.backgroundColor")
+        if bg and _is_dark_color(bg):
+            return "dark"
+        if bg:
+            return "light"
+    except Exception:
+        pass
+    return "light"
+
+
+THEME = get_active_theme()
+IS_DARK = THEME == "dark"
+
+# Resolved tokens
+_accent = TA_ORANGE
+_bg = TA_DARK_BG if IS_DARK else "#FFFFFF"
+_bg2 = TA_DARK_SURFACE if IS_DARK else TA_GREY_100
+_text = TA_TEXT_DARK if IS_DARK else TA_TEXT_LIGHT
+_text_m = TA_DARK_TEXT_MUTED if IS_DARK else TA_GREY_700
+_border = TA_DARK_BORDER if IS_DARK else TA_GREY_200
+_card_bg = TA_DARK_SURFACE if IS_DARK else TA_GREY_100
+_sb_bg = "#010409" if IS_DARK else TA_NAVY
+_sb_text = TA_TEXT_DARK if IS_DARK else "#FFFFFF"
+
+# ─── CSS Injection (Primary Theming Mechanism) ───────────────────────────────
 st.markdown(f"""
 <style>
-/* ── Global reset ── */
-[data-testid="stAppViewContainer"] {{background:{ST_BG};}}
-header[data-testid="stHeader"] {{background:{ST_NAVY};}}
-.stTabs [data-baseweb="tab-list"] {{gap:0;}}
-.stTabs [data-baseweb="tab"] {{
-    padding:10px 28px; font-weight:600; color:{ST_NAVY};
-    border-bottom:3px solid transparent;
-}}
-.stTabs [aria-selected="true"] {{
-    border-bottom:3px solid {ST_ORANGE}; color:{ST_ORANGE};
-}}
-/* ── Metric cards ── */
-.metric-card {{
-    background:{ST_CARD}; border-radius:10px; padding:18px 22px;
-    border-left:4px solid {ST_ORANGE};
-}}
-.metric-card .label {{font-size:12px; color:#6B7280; text-transform:uppercase; letter-spacing:.5px;}}
-.metric-card .value {{font-size:28px; font-weight:700; color:{ST_NAVY}; margin:4px 0;}}
-.metric-card .sub {{font-size:12px; color:#9CA3AF;}}
-/* ── Status pills ── */
-.pill {{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;}}
-.pill-success {{background:#DCFCE7;color:#166534;}}
-.pill-failed {{background:#FEE2E2;color:#991B1B;}}
-.pill-running {{background:#FEF3C7;color:#92400E;}}
-.pill-pending {{background:#E5E7EB;color:#374151;}}
-/* ── Header bar ── */
-.header-bar {{
-    background:linear-gradient(135deg, {ST_NAVY} 0%, #16213E 100%);
-    padding:20px 30px; border-radius:12px; margin-bottom:24px;
-}}
-.header-bar h1 {{color:white; margin:0; font-size:26px;}}
-.header-bar p {{color:#94A3B8; margin:4px 0 0 0; font-size:14px;}}
+    /* ═══ PAGE-LEVEL ═══ */
+    .stApp {{
+        background-color: {_bg};
+        color: {_text};
+        font-family: 'Source Sans Pro', 'Segoe UI', sans-serif;
+    }}
+    [data-testid="stAppViewContainer"] {{
+        background-color: {_bg};
+        color: {_text};
+    }}
+    h1, h2, h3, h4, h5, h6 {{ color: {_text}; }}
+    .stMarkdown, .stText, .stCaption {{ color: {_text}; }}
+
+    /* ═══ SIDEBAR ═══ */
+    section[data-testid="stSidebar"] {{
+        background-color: {_sb_bg};
+        color: {_sb_text};
+    }}
+    section[data-testid="stSidebar"] > div:first-child {{
+        border-top: 4px solid {_accent};
+    }}
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] .stRadio label,
+    section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label,
+    section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label p,
+    section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label div,
+    section[data-testid="stSidebar"] .stSelectbox label {{
+        color: {_sb_text} !important;
+    }}
+
+    /* ═══ METRIC CARDS (native st.metric) ═══ */
+    div[data-testid="stMetric"] {{
+        background-color: {_card_bg};
+        border-left: 4px solid {_accent};
+        border-radius: 8px;
+        padding: 12px 16px;
+    }}
+
+    /* ═══ CUSTOM METRIC CARDS ═══ */
+    .metric-card {{
+        background: {_card_bg}; border-radius: 10px; padding: 18px 22px;
+        border-left: 4px solid {_accent};
+    }}
+    .metric-card .label {{font-size:12px; color:{_text_m}; text-transform:uppercase; letter-spacing:.5px;}}
+    .metric-card .value {{font-size:28px; font-weight:700; color:{_text}; margin:4px 0;}}
+    .metric-card .sub {{font-size:12px; color:{_text_m};}}
+
+    /* ═══ BUTTONS ═══ */
+    .stButton > button {{
+        background-color: {_accent};
+        color: #FFFFFF;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+    }}
+    .stButton > button:hover {{
+        background-color: {TA_ORANGE_DARK};
+        color: #FFFFFF;
+    }}
+
+    /* ═══ TABS ═══ */
+    .stTabs [data-baseweb="tab-list"] {{gap:0;}}
+    .stTabs [data-baseweb="tab"] {{
+        padding:10px 28px; font-weight:600; color:{_text};
+        border-bottom:3px solid transparent;
+    }}
+    .stTabs [aria-selected="true"] {{
+        border-bottom-color: {_accent} !important;
+        color: {_accent} !important;
+    }}
+
+    /* ═══ STATUS PILLS ═══ */
+    .pill {{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;}}
+    .pill-success {{background:#DCFCE7;color:#166534;}}
+    .pill-failed {{background:#FEE2E2;color:#991B1B;}}
+    .pill-running {{background:#FEF3C7;color:#92400E;}}
+    .pill-pending {{background:#E5E7EB;color:#374151;}}
+
+    /* ═══ INPUTS ═══ */
+    .stSelectbox > div > div,
+    .stMultiSelect > div > div,
+    .stTextInput > div > div {{
+        border-color: {_border};
+    }}
+
+    /* ═══ LINKS ═══ */
+    a {{ color: {_accent}; }}
+
+    /* ═══ SPACING ═══ */
+    div.block-container {{ padding-top: 1.5rem; }}
 </style>
 """, unsafe_allow_html=True)
 
 
+# ─── Sidebar Branding ────────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("assets/logos/ta_logo_dark.svg", width=140)
+    st.markdown("---")
+    st.markdown(f"""
+    <p style="color:{_sb_text}; font-size:13px;">
+        <strong>MSSQL → Snowflake</strong><br>
+        Data Migration Console<br><br>
+        <span style="font-size:11px; color:{TA_DARK_TEXT_MUTED};">
+        Pipeline: BCP → Cloud → COPY → MERGE
+        </span>
+    </p>
+    """, unsafe_allow_html=True)
+    st.markdown("---")
+
+
 # ─── Header ──────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="header-bar">
-    <h1>❄️ MSSQL → Snowflake Migration Console</h1>
-    <p>Azure SQL Server to Snowflake data pipeline — BCP Export → Cloud Upload → COPY INTO → MERGE</p>
-</div>
-""", unsafe_allow_html=True)
+def render_header(title: str):
+    logo = "assets/logos/ta_logo_dark.svg" if IS_DARK else "assets/logos/ta_logo_light.svg"
+    col_logo, col_title = st.columns([1, 5])
+    with col_logo:
+        st.image(logo, width=120)
+    with col_title:
+        st.markdown(
+            f'<h2 style="margin:0;padding:0;font-size:1.6rem;font-weight:700;color:{_text};">{title}</h2>'
+            f'<p style="margin:4px 0 0 0;font-size:0.85rem;color:{_text_m};">Azure SQL Server → Snowflake data pipeline</p>',
+            unsafe_allow_html=True,
+        )
+
+
+render_header("MSSQL → Snowflake Migration Console")
 
 
 # ─── Connection Helpers ──────────────────────────────────────────────────────
@@ -170,10 +301,13 @@ def status_pill(status):
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
 def render_footer():
-    st.markdown(f"""<br><hr style="border:none;border-top:1px solid #E5E7EB;">
-    <div style="text-align:center;padding:8px;color:#9CA3AF;font-size:12px;">
-        MSSQL → Snowflake Migration Console &nbsp;|&nbsp; Built with Streamlit
-    </div>""", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown(
+        f'<p style="text-align:center; color:{_text_m}; font-size:0.8rem;">'
+        f'Powered by <span style="color:{TA_ORANGE}; font-weight:600;">Tiger Analytics</span>'
+        f' · Built on Snowflake</p>',
+        unsafe_allow_html=True,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -207,25 +341,14 @@ with tab_dash:
 
         # KPI Cards
         c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(f"""<div class="metric-card">
-            <div class="label">Total Jobs</div>
-            <div class="value">{total}</div>
-            <div class="sub">all batches</div></div>""", unsafe_allow_html=True)
-        c2.markdown(f"""<div class="metric-card" style="border-left-color:{ST_SUCCESS}">
-            <div class="label">Successful</div>
-            <div class="value" style="color:{ST_SUCCESS}">{success}</div>
-            <div class="sub">{success/total*100:.0f}% success rate</div></div>""", unsafe_allow_html=True)
-        c3.markdown(f"""<div class="metric-card" style="border-left-color:{ST_FAILED}">
-            <div class="label">Failed</div>
-            <div class="value" style="color:{ST_FAILED}">{failed}</div>
-            <div class="sub">needs attention</div></div>""", unsafe_allow_html=True)
-        c4.markdown(f"""<div class="metric-card">
-            <div class="label">Avg Duration</div>
-            <div class="value">{avg_dur:.0f}s</div>
-            <div class="sub">per job</div></div>""" if pd.notna(avg_dur) else f"""<div class="metric-card">
-            <div class="label">Avg Duration</div>
-            <div class="value">N/A</div>
-            <div class="sub">no data</div></div>""", unsafe_allow_html=True)
+        with c1:
+            st.metric("Total Jobs", total, f"{len(log_df['BATCH_ID'].unique())} batches")
+        with c2:
+            st.metric("Successful", success, f"{success/total*100:.0f}%")
+        with c3:
+            st.metric("Failed", failed)
+        with c4:
+            st.metric("Avg Duration", f"{avg_dur:.0f}s" if pd.notna(avg_dur) else "N/A")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
