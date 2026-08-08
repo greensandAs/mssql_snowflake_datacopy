@@ -1,14 +1,12 @@
 -- ============================================================================
 -- MSSQL → Snowflake Migration: Azure SQL Test Data Setup
 -- ============================================================================
--- Run this in Azure Query Editor or SSMS connected to ta-poc.database.windows.net
--- Login: tapocadmin / tiger@12345
+-- INSTRUCTIONS:
+-- 1. Connect to ta-poc.database.windows.net / master
+-- 2. Run: CREATE DATABASE TestDB;
+-- 3. RECONNECT to ta-poc.database.windows.net / TestDB
+-- 4. Run everything below
 -- ============================================================================
-
--- Create the test database (run on master if using SSMS)
--- In Azure Query Editor, select 'master' database first:
--- CREATE DATABASE TestDB;
--- Then switch to TestDB and run the rest.
 
 -- ============================================================================
 -- TABLE 1: Customers (FULL load test — 100 rows)
