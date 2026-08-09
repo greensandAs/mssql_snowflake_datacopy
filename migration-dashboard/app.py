@@ -64,7 +64,7 @@ div.block-container {{padding-top:1.5rem;}}
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image(LOGO_LIGHT, width=140)
+    st.image(LOGO_DARK, width=140)
     st.markdown("---")
     st.markdown("""<p style="color:#FFFFFF;font-size:13px;">
         <strong>MSSQL → Snowflake</strong><br>Data Migration Console
@@ -153,11 +153,14 @@ def pipeline_extract(tbl: dict, batch_id: int, job_id: int, progress, status_tex
     src_schema = tbl.get("source_schema", "dbo")
     src_table = tbl["source_table"]
     tgt_table = tbl["target_table"]
+    delimiter = tbl.get("delimiter", "|")
+    custom_sql = tbl.get("custom_sql")
+    filter_condition = tbl.get("filter_condition")
 
     export_dir = Path(os.getenv("EXPORT_DIR", "./export")).resolve()
     export_dir.mkdir(parents=True, exist_ok=True)
     sas_token = os.getenv("AZ_SAS_TOKEN", "")
-    cloud_path = os.getenv("CLOUD_PATH", "")
+    cloud_path = tbl.get("cloud_path") or os.getenv("CLOUD_PATH", "")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{src_db}_{src_schema}_{src_table}_{ts}.csv"
@@ -169,12 +172,37 @@ def pipeline_extract(tbl: dict, batch_id: int, job_id: int, progress, status_tex
     progress.progress(0.2)
     status_text.text("Extracting: BCP export from MSSQL...")
 
-    bcp_cmd = (
-        f'bcp "[{src_schema}].[{src_table}]" queryout "{filepath}" '
-        f'-S {os.getenv("MSSQL_SERVER")} -d {src_db} '
-        f'-U {os.getenv("MSSQL_USER")} -P {os.getenv("MSSQL_PASSWORD")} '
-        f'-c -t "|" -C 65001'
-    )
+    # Build BCP command based on config
+    if custom_sql:
+        # Use queryout with custom SQL
+        bcp_cmd = (
+            f'bcp "{custom_sql}" queryout "{filepath}" '
+            f'-S {os.getenv("MSSQL_SERVER")} '
+            f'-d {src_db} '
+            f'-U {os.getenv("MSSQL_USER")} '
+            f'-P {os.getenv("MSSQL_PASSWORD")} '
+            f'-c -t "{delimiter}" -C 65001'
+        )
+    elif filter_condition:
+        # Use queryout with SELECT + WHERE filter
+        query = f"SELECT * FROM [{src_schema}].[{src_table}] WHERE {filter_condition}"
+        bcp_cmd = (
+            f'bcp "{query}" queryout "{filepath}" '
+            f'-S {os.getenv("MSSQL_SERVER")} '
+            f'-d {src_db} '
+            f'-U {os.getenv("MSSQL_USER")} '
+            f'-P {os.getenv("MSSQL_PASSWORD")} '
+            f'-c -t "{delimiter}" -C 65001'
+        )
+    else:
+        # Standard table export
+        bcp_cmd = (
+            f'bcp "{src_db}.{src_schema}.{src_table}" out "{filepath}" '
+            f'-S {os.getenv("MSSQL_SERVER")} '
+            f'-U {os.getenv("MSSQL_USER")} '
+            f'-P {os.getenv("MSSQL_PASSWORD")} '
+            f'-c -t "{delimiter}" -C 65001'
+        )
     try:
         proc = subprocess.run(bcp_cmd, shell=True, capture_output=True, text=True, timeout=600)
         if proc.returncode in (0, 4):
@@ -243,6 +271,7 @@ def pipeline_load(tbl: dict, batch_id: int, job_id: int, progress, status_text) 
     src_table = tbl["source_table"]
     pk = tbl.get("primary_key", "")
     load_type = tbl.get("load_type", "full")
+    delimiter = tbl.get("delimiter", "|")
     sf_stage = os.getenv("SF_STAGE", "@DATA_MIGRATION.CONTROL.MIGRATION_STAGE")
 
     ctx = {"sf_count": 0, "ok": True, "logs": []}
@@ -263,9 +292,9 @@ def pipeline_load(tbl: dict, batch_id: int, job_id: int, progress, status_text) 
     # ── COPY INTO ─────────────────────────────────────────────────────────────
     copy_sql = (
         f"COPY INTO {fqn} FROM {sf_stage}/{tgt_table}/ "
-        f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
+        f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='{delimiter}' FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
         f"NULL_IF=('NULL','') SKIP_HEADER=0) "
-        f"PATTERN='.*{src_table}.*\\.csv' ON_ERROR='CONTINUE'"
+        f"ON_ERROR='CONTINUE'"
     )
     try:
         sf_execute(copy_sql)
@@ -275,6 +304,26 @@ def pipeline_load(tbl: dict, batch_id: int, job_id: int, progress, status_text) 
             "COPY_COMMAND=%s WHERE BATCH_ID=%s AND JOB_ID=%s",
             (copy_sql[:10000], batch_id, job_id),
         )
+
+        # ── Move loaded files to processed/ in Azure Blob ─────────────────────
+        sas_token = os.getenv("AZ_SAS_TOKEN", "")
+        cloud_path = os.getenv("CLOUD_PATH", "")
+        if sas_token and cloud_path:
+            src_blob = f"{cloud_path}{tgt_table}/?{sas_token}"
+            dst_blob = f"{cloud_path}processed/{tgt_table}/?{sas_token}"
+            try:
+                move_cmd = f'azcopy cp "{src_blob}" "{dst_blob}" --recursive'
+                proc = subprocess.run(move_cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if proc.returncode == 0:
+                    # Delete originals after successful copy
+                    rm_cmd = f'azcopy rm "{src_blob}" --recursive'
+                    subprocess.run(rm_cmd, shell=True, capture_output=True, text=True, timeout=120)
+                    ctx["logs"].append(f"Moved {tgt_table}/ → processed/{tgt_table}/")
+                else:
+                    ctx["logs"].append(f"Move to processed/ skipped: {proc.stderr[:200]}")
+            except Exception as e:
+                ctx["logs"].append(f"Move to processed/ failed: {e}")
+
     except Exception as e:
         ctx["ok"] = False
         ctx["logs"].append(f"COPY INTO FAILED: {e}")
@@ -387,10 +436,12 @@ with tab_config:
     # KPIs
     total_t = len(tables)
     active_t = sum(1 for t in tables if t.get("active"))
-    kc1, kc2, kc3 = st.columns(3)
+    incr_t = sum(1 for t in tables if t.get("load_type") == "incremental")
+    kc1, kc2, kc3, kc4 = st.columns(4)
     kc1.metric("Total Tables", total_t)
     kc2.metric("Active", active_t)
     kc3.metric("Inactive", total_t - active_t)
+    kc4.metric("Incremental", incr_t)
 
     # Table view
     if tables:
@@ -398,8 +449,13 @@ with tab_config:
             pd.DataFrame([{
                 "Source": f"{t.get('source_db')}.{t.get('source_schema','dbo')}.{t.get('source_table')}",
                 "Target": f"{t.get('target_db','')}.{t.get('target_schema','')}.{t.get('target_table')}",
-                "Load": t.get("load_type", "full").upper(),
+                "Load": (t.get("load_type") or "full").upper(),
+                "Mode": (t.get("execution_mode") or "FULL").upper(),
                 "PK": t.get("primary_key") or "—",
+                "CDC": t.get("cdc_columns") or "—",
+                "CDC Type": (t.get("cdc_type") or "TIMESTAMP").upper(),
+                "SCD": t.get("scd_type", 0),
+                "Delimiter": t.get("delimiter", "|"),
                 "Active": "✅" if t.get("active") else "❌",
                 "Last Run": t.get("last_run_status") or "—",
             } for t in tables]),
@@ -463,51 +519,111 @@ with tab_config:
                         "source_db": st.session_state["disc_db"],
                         "source_schema": st.session_state["disc_sch"],
                         "source_table": d["table"],
-                        "target_db": os.getenv("SF_DATABASE", "DATA_MIGRATION"),
+                        "target_db": "ANALYTICS",
                         "target_schema": "PUBLIC",
                         "target_table": d["table"].upper(),
                         "primary_key": d["pk"],
                         "load_type": d["load"],
-                        "watermark_col": d["wm"],
+                        "cdc_columns": d["wm"],
+                        "cdc_type": "TIMESTAMP",
+                        "scd_type": 0,
+                        "execution_mode": "FULL",
+                        "delimiter": "|",
+                        "filter_condition": None,
+                        "trim": "N",
+                        "encryption_columns": None,
+                        "custom_sql": None,
+                        "cloud_path": os.getenv("CLOUD_PATH", ""),
+                        "warehouse_name": os.getenv("SF_WAREHOUSE", "COMPUTE_WH"),
                         "active": True,
                         "last_run_status": None,
-                        "cloud_path": os.getenv("CLOUD_PATH", ""),
                     })
                 cfg["tables"] = tables
                 save_config(cfg)
                 del st.session_state["disc"]
                 st.rerun()
 
-    # ── Add Manually ──────────────────────────────────────────────────────────
+    # ── Add Manually (Full Form) ──────────────────────────────────────────────
     with st.expander("➕ Add Table Manually"):
         with st.form("add_form"):
+            st.markdown("**Source (MSSQL)**")
             ac1, ac2, ac3 = st.columns(3)
             with ac1:
-                a_db = st.text_input("Source DB", key="a_db")
+                a_db = st.text_input("Database *", key="a_db")
             with ac2:
-                a_sch = st.text_input("Source Schema", value="dbo", key="a_sch")
+                a_sch = st.text_input("Schema", value="dbo", key="a_sch")
             with ac3:
-                a_tbl = st.text_input("Source Table", key="a_tbl")
-            ac4, ac5, ac6 = st.columns(3)
-            with ac4:
-                a_pk = st.text_input("Primary Key", key="a_pk")
-            with ac5:
-                a_load = st.selectbox("Load Type", ["full", "incremental"], key="a_load")
-            with ac6:
-                a_wm = st.text_input("Watermark Col", key="a_wm")
-            if st.form_submit_button("Add"):
+                a_tbl = st.text_input("Table *", key="a_tbl")
+
+            st.markdown("**Target (Snowflake)**")
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            with tc1:
+                a_tgt_db = st.text_input("Target DB", value="ANALYTICS", key="a_tgt_db")
+            with tc2:
+                a_tgt_sch = st.text_input("Target Schema", value="PUBLIC", key="a_tgt_sch")
+            with tc3:
+                a_tgt_tbl = st.text_input("Target Table", key="a_tgt_tbl")
+            with tc4:
+                a_wh = st.text_input("Warehouse", value=os.getenv("SF_WAREHOUSE", "COMPUTE_WH"), key="a_wh")
+
+            st.markdown("**Load Settings**")
+            ls1, ls2, ls3, ls4 = st.columns(4)
+            with ls1:
+                a_load = st.selectbox("Load Type *", ["full", "incremental", "filter"], key="a_load")
+            with ls2:
+                a_mode = st.selectbox("Execution Mode", ["FULL", "EXPORT", "INGEST"], key="a_mode")
+            with ls3:
+                a_scd = st.selectbox("SCD Type", [0, 1, 2], key="a_scd")
+            with ls4:
+                a_cdc_type = st.selectbox("CDC Type", ["TIMESTAMP", "ID"], key="a_cdc_type")
+
+            ls5, ls6, ls7 = st.columns(3)
+            with ls5:
+                a_pk = st.text_input("Primary Key *", key="a_pk")
+            with ls6:
+                a_cdc = st.text_input("CDC/Watermark Column(s)", placeholder="ModifiedDate,CreatedDate", key="a_cdc")
+            with ls7:
+                a_delim = st.text_input("Delimiter", value="|", key="a_delim")
+
+            st.markdown("**Advanced**")
+            av1, av2 = st.columns(2)
+            with av1:
+                a_filter = st.text_input("Filter Condition", placeholder="Status = 'Active'", key="a_filter")
+                a_trim = st.selectbox("Trim", ["N", "Y"], key="a_trim")
+            with av2:
+                a_encrypt = st.text_input("Encryption Columns", placeholder="SSN,CreditCard", key="a_encrypt")
+                a_cloud = st.text_input("Cloud Path", value=os.getenv("CLOUD_PATH", ""), key="a_cloud")
+
+            a_sql = st.text_area("Custom SQL (overrides table export)", placeholder="SELECT col1, col2 FROM ...", key="a_sql", height=80)
+
+            if st.form_submit_button("Add Configuration", type="primary"):
                 if a_db and a_tbl and a_pk:
                     tables.append({
-                        "source_db": a_db, "source_schema": a_sch, "source_table": a_tbl,
-                        "target_db": os.getenv("SF_DATABASE", "DATA_MIGRATION"),
-                        "target_schema": "PUBLIC", "target_table": a_tbl.upper(),
-                        "primary_key": a_pk.upper(), "load_type": a_load,
-                        "watermark_col": a_wm.upper() if a_wm else None,
-                        "active": True, "last_run_status": None,
-                        "cloud_path": os.getenv("CLOUD_PATH", ""),
+                        "source_db": a_db,
+                        "source_schema": a_sch,
+                        "source_table": a_tbl,
+                        "target_db": a_tgt_db or "ANALYTICS",
+                        "target_schema": a_tgt_sch or "PUBLIC",
+                        "target_table": (a_tgt_tbl or a_tbl).upper(),
+                        "warehouse_name": a_wh or "COMPUTE_WH",
+                        "scd_type": a_scd,
+                        "load_type": a_load,
+                        "cdc_columns": a_cdc.upper() if a_cdc else None,
+                        "cdc_type": a_cdc_type,
+                        "primary_key": a_pk.upper(),
+                        "delimiter": a_delim or "|",
+                        "filter_condition": a_filter or None,
+                        "trim": a_trim,
+                        "encryption_columns": a_encrypt or None,
+                        "cloud_path": a_cloud or os.getenv("CLOUD_PATH", ""),
+                        "custom_sql": a_sql or None,
+                        "execution_mode": a_mode,
+                        "active": True,
+                        "last_run_status": None,
                     })
                     cfg["tables"] = tables
                     save_config(cfg)
+                    st.success(f"Added {a_db}.{a_sch}.{a_tbl}")
                     st.rerun()
                 else:
                     st.error("Source DB, Table, and Primary Key are required.")
@@ -528,8 +644,8 @@ with tab_config:
                 if st.button("Delete", key="m_del"):
                     tables.pop(idx); cfg["tables"] = tables; save_config(cfg); st.rerun()
 
-    # ── Sync ──────────────────────────────────────────────────────────────────
-    with st.expander("🔄 Sync (Local ↔ Snowflake)"):
+    # ── Sync (Local ↔ Snowflake CONFIG_TABLE) ─────────────────────────────────
+    with st.expander("🔄 Sync (Local ↔ Snowflake CONFIG_TABLE)"):
         sy1, sy2 = st.columns(2)
         with sy1:
             if st.button("⬆️ Push → Snowflake", key="push"):
@@ -537,30 +653,55 @@ with tab_config:
                 for t in tables:
                     sf_execute(
                         "INSERT INTO DATA_MIGRATION.CONTROL.CONFIG_TABLE "
-                        "(MSSQL_DATABASE_NAME,MSSQL_SCHEMA_NAME,MSSQL_TABLE_NAME,"
-                        "SF_DATABASE_NAME,SF_SCHEMA_NAME,SF_TABLE_NAME,"
-                        "LOAD_TYPE,PRIMARY_KEY,CDC_COLUMNS,ENABLED) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                        (t.get("source_db"), t.get("source_schema","dbo"), t.get("source_table"),
-                         t.get("target_db"), t.get("target_schema"), t.get("target_table"),
-                         t.get("load_type","full").upper(), t.get("primary_key"),
-                         t.get("watermark_col"), "Y" if t.get("active") else "N"),
+                        "(MSSQL_DATABASE_NAME, MSSQL_SCHEMA_NAME, MSSQL_TABLE_NAME, "
+                        "SF_DATABASE_NAME, SF_SCHEMA_NAME, SF_TABLE_NAME, "
+                        "WAREHOUSE_NAME, SCD_TYPE, LOAD_TYPE, CDC_COLUMNS, PRIMARY_KEY, "
+                        "DELIMITER, FILTER_CONDITION, TRIM, ENCRYPTION_COLUMNS, "
+                        "S3_PATH, CUSTOM_SQL, EXECUTION_MODE, CDC_TYPE, ENABLED) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (
+                            t.get("source_db"), t.get("source_schema", "dbo"), t.get("source_table"),
+                            t.get("target_db", "ANALYTICS"), t.get("target_schema", "PUBLIC"), t.get("target_table"),
+                            t.get("warehouse_name", "COMPUTE_WH"), t.get("scd_type", 0),
+                            (t.get("load_type") or "full").upper(), t.get("cdc_columns"),
+                            t.get("primary_key"), t.get("delimiter", "|"),
+                            t.get("filter_condition"), t.get("trim", "N"),
+                            t.get("encryption_columns"), t.get("cloud_path"),
+                            t.get("custom_sql"), (t.get("execution_mode") or "FULL").upper(),
+                            (t.get("cdc_type") or "TIMESTAMP").upper(),
+                            "Y" if t.get("active") else "N",
+                        ),
                     )
-                st.success(f"Pushed {len(tables)} table(s)")
+                st.success(f"Pushed {len(tables)} table(s) with all fields")
         with sy2:
             if st.button("⬇️ Pull ← Snowflake", key="pull"):
                 df = sf_query("SELECT * FROM DATA_MIGRATION.CONTROL.CONFIG_TABLE ORDER BY JOB_ID")
                 if not df.empty:
                     cfg["tables"] = [{
-                        "source_db": r["MSSQL_DATABASE_NAME"], "source_schema": r["MSSQL_SCHEMA_NAME"],
-                        "source_table": r["MSSQL_TABLE_NAME"], "target_db": r["SF_DATABASE_NAME"],
-                        "target_schema": r["SF_SCHEMA_NAME"], "target_table": r["SF_TABLE_NAME"],
-                        "primary_key": r.get("PRIMARY_KEY"), "load_type": (r.get("LOAD_TYPE") or "full").lower(),
-                        "watermark_col": r.get("CDC_COLUMNS"), "active": r.get("ENABLED") == "Y",
-                        "last_run_status": None, "cloud_path": os.getenv("CLOUD_PATH", ""),
+                        "source_db": r["MSSQL_DATABASE_NAME"],
+                        "source_schema": r["MSSQL_SCHEMA_NAME"],
+                        "source_table": r["MSSQL_TABLE_NAME"],
+                        "target_db": r["SF_DATABASE_NAME"],
+                        "target_schema": r["SF_SCHEMA_NAME"],
+                        "target_table": r["SF_TABLE_NAME"],
+                        "warehouse_name": r.get("WAREHOUSE_NAME", "COMPUTE_WH"),
+                        "scd_type": int(r.get("SCD_TYPE", 0) or 0),
+                        "load_type": (r.get("LOAD_TYPE") or "full").lower(),
+                        "cdc_columns": r.get("CDC_COLUMNS"),
+                        "primary_key": r.get("PRIMARY_KEY"),
+                        "delimiter": r.get("DELIMITER", "|"),
+                        "filter_condition": r.get("FILTER_CONDITION"),
+                        "trim": r.get("TRIM", "N"),
+                        "encryption_columns": r.get("ENCRYPTION_COLUMNS"),
+                        "cloud_path": r.get("S3_PATH") or os.getenv("CLOUD_PATH", ""),
+                        "custom_sql": r.get("CUSTOM_SQL"),
+                        "execution_mode": (r.get("EXECUTION_MODE") or "FULL").upper(),
+                        "cdc_type": (r.get("CDC_TYPE") or "TIMESTAMP").upper(),
+                        "active": r.get("ENABLED") == "Y",
+                        "last_run_status": None,
                     } for _, r in df.iterrows()]
                     save_config(cfg)
-                    st.success(f"Pulled {len(df)} table(s)")
+                    st.success(f"Pulled {len(df)} table(s) with all fields")
                     st.rerun()
 
 
