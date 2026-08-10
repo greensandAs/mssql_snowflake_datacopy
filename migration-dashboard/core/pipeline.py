@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import save_config
@@ -39,7 +39,7 @@ def run_single_table(tbl: dict, mode: str, batch_id: int, job_id: int,
             status_cb(msg)
 
     src_table = tbl["source_table"]
-    job_start = datetime.now()
+    job_start = datetime.now(timezone.utc).replace(tzinfo=None)  # UTC, timezone-naive for MSSQL compat
     logs = []
     row_count = 0
     sf_count = 0
@@ -116,6 +116,10 @@ def run_single_table(tbl: dict, mode: str, batch_id: int, job_id: int,
         logs.extend(load_result["logs"])
         sf_count = load_result["sf_count"]
 
+        # In LOAD mode, BCP doesn't run so use rows_loaded from COPY INTO
+        if mode == "LOAD" and row_count == 0:
+            row_count = load_result.get("rows_loaded", 0)
+
         if load_result["returncode"] != 0:
             update_step(batch_id, job_id, "COPY_COMMAND_STATUS", "FAILED", "\n".join(load_result["logs"]))
             return _finalize(tbl, batch_id, job_id, job_start, "FAILED", row_count, sf_count, logs)
@@ -138,7 +142,7 @@ def run_single_table(tbl: dict, mode: str, batch_id: int, job_id: int,
 
 def _finalize(tbl, batch_id, job_id, job_start, status, row_count, sf_count, logs) -> dict:
     """Finalize a job: update LOG_TABLE and config."""
-    job_end = datetime.now()
+    job_end = datetime.now(timezone.utc).replace(tzinfo=None)
     duration = int((job_end - job_start).total_seconds())
 
     try:

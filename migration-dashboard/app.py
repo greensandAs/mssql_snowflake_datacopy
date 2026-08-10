@@ -35,20 +35,60 @@ LOGO_LIGHT = str(Path(__file__).parent / "assets" / "logos" / "ta_logo_light.svg
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Tiger Analytics | MSSQL → Snowflake", layout="wide")
 
-# ─── CSS ─────────────────────────────────────────────────────────────────────
+# ─── CSS (Tiger Analytics Branding) ──────────────────────────────────────────
 st.markdown(f"""
 <style>
-.stTabs [data-baseweb="tab-list"] {{gap:0;}}
-.stTabs [data-baseweb="tab"] {{padding:10px 28px;font-weight:600;border-bottom:3px solid transparent;}}
-.stTabs [aria-selected="true"] {{border-bottom-color:{TA_ORANGE} !important;color:{TA_ORANGE} !important;}}
-div[data-testid="stMetric"] {{background:#F8F9FA;border-left:4px solid {TA_ORANGE};border-radius:8px;padding:12px 16px;}}
+    /* ═══ SIDEBAR ═══ */
+    section[data-testid="stSidebar"] {{
+        background-color: {TA_NAVY};
+    }}
+    section[data-testid="stSidebar"] > div:first-child {{
+        border-top: 4px solid {TA_ORANGE};
+    }}
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stCaption {{
+        color: #FFFFFF !important;
+    }}
+
+    /* ═══ TABS ═══ */
+    .stTabs [data-baseweb="tab-list"] {{gap:0;}}
+    .stTabs [data-baseweb="tab"] {{
+        padding:10px 28px; font-weight:600;
+        border-bottom:3px solid transparent;
+    }}
+    .stTabs [aria-selected="true"] {{
+        border-bottom-color: {TA_ORANGE} !important;
+        color: {TA_ORANGE} !important;
+    }}
+
+    /* ═══ METRIC CARDS ═══ */
+    div[data-testid="stMetric"] {{
+        background: #F8F9FA;
+        border-left: 4px solid {TA_ORANGE};
+        border-radius: 8px;
+        padding: 12px 16px;
+    }}
+
+    /* ═══ BUTTONS ═══ */
+    .stButton > button[kind="primary"] {{
+        background-color: {TA_ORANGE};
+        color: #FFFFFF;
+        border: none;
+    }}
+    .stButton > button[kind="primary"]:hover {{
+        background-color: #D94E1C;
+    }}
+
+    /* ═══ SPACING ═══ */
+    div.block-container {{ padding-top: 1.5rem; }}
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    if Path(LOGO_DARK).exists():
-        st.image(LOGO_DARK, width=140)
+    if Path(LOGO_LIGHT).exists():
+        st.image(LOGO_LIGHT, width=140)
     st.markdown("---")
     st.markdown("**MSSQL → Snowflake**\n\nData Migration Console")
     st.markdown("---")
@@ -240,14 +280,6 @@ with tab_config:
                     })
                     cfg["tables"] = tables; save_config(cfg); st.success("Saved."); st.rerun()
 
-    # Sync pull
-    with st.expander("🔄 Sync"):
-        if st.button("⬇️ Pull from Snowflake CONFIG_TABLE", key="pull"):
-            pulled = pull_from_snowflake()
-            if pulled["tables"]:
-                save_config(pulled)
-                st.success(f"Pulled {len(pulled['tables'])} table(s)")
-                st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -271,32 +303,73 @@ with tab_run:
             desc = {"FULL": "BCP → GZip → Upload → COPY INTO WRK → MERGE", "EXPORT": "BCP → GZip → Upload only", "LOAD": "COPY INTO WRK → MERGE only"}
             st.info(desc[mode])
         if st.button("🚀 Start Migration", type="primary", disabled=not selected):
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import threading
+
             batch_id = get_next_batch_id()
-            st.markdown(f"#### Batch `{batch_id}` — {mode} mode — {len(selected)} table(s)")
+            run_tables = [(active[i], i + 1) for i in selected]
+            total_count = len(run_tables)
+            max_workers = min(total_count, 12)
+
+            st.markdown(f"#### Batch `{batch_id}` — {mode} mode — {total_count} table(s) — {max_workers} parallel workers")
+
+            # Progress tracking
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            completed_count = {"n": 0}
+            lock = threading.Lock()
+
             results = []
-            for i in selected:
-                tbl = active[i]
-                job_id = i + 1
+
+            def _run_and_track(tbl, job_id):
+                result = run_single_table(tbl, mode, batch_id, job_id)
+                with lock:
+                    completed_count["n"] += 1
+                    n = completed_count["n"]
+                return result
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_run_and_track, tbl, job_id): tbl
+                    for tbl, job_id in run_tables
+                }
+                for future in as_completed(futures):
+                    tbl = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        results.append({
+                            "table": tbl["source_table"], "status": "FAILED",
+                            "duration": 0, "row_count": 0, "sf_count": 0,
+                            "logs": [f"Pipeline exception: {e}"],
+                        })
+                    # Update progress
+                    done = len(results)
+                    progress_bar.progress(done / total_count)
+                    s = sum(1 for r in results if r["status"] == "SUCCESS")
+                    f = sum(1 for r in results if r["status"] == "FAILED")
+                    progress_text.text(f"Progress: {done}/{total_count} — ✅ {s} success · ❌ {f} failed")
+
+            progress_bar.progress(1.0)
+            progress_text.empty()
+
+            # Display results with logs after all complete
+            for result in sorted(results, key=lambda r: r["table"]):
                 with st.container(border=True):
-                    st.markdown(f"**{tbl['source_table']}** → {tbl['target_table']}")
-                    progress = st.progress(0)
-                    status_text = st.empty()
-                    log_exp = st.expander("Log", expanded=False)
-
-                    result = run_single_table(
-                        tbl, mode, batch_id, job_id,
-                        progress_cb=progress.progress,
-                        status_cb=status_text.text,
-                    )
-                    results.append(result)
-
                     if result["status"] == "SUCCESS":
-                        status_text.markdown(f"✅ **{result['table']}** — {result['duration']}s · {result['row_count']:,} extracted · {result['sf_count']:,} in target")
+                        st.markdown(
+                            f"✅ **{result['table']}** — {result['duration']}s · "
+                            f"{result['row_count']:,} extracted · {result['sf_count']:,} in target"
+                        )
                     else:
-                        status_text.markdown(f"❌ **{result['table']}** — failed")
-                    with log_exp:
-                        for line in result["logs"]:
-                            st.text(line)
+                        st.markdown(f"❌ **{result['table']}** — failed")
+
+                    with st.expander("Log", expanded=(result["status"] != "SUCCESS")):
+                        if result["logs"]:
+                            for line in result["logs"]:
+                                st.text(line)
+                        else:
+                            st.text("No log output captured.")
 
             # Save config (last_run_status updated)
             save_config(cfg)
@@ -305,10 +378,11 @@ with tab_run:
             st.markdown("---")
             s_count = sum(1 for r in results if r["status"] == "SUCCESS")
             f_count = sum(1 for r in results if r["status"] == "FAILED")
-            sc1, sc2, sc3 = st.columns(3)
+            sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Total", len(results))
             sc2.metric("Success", s_count)
             sc3.metric("Failed", f_count)
+            sc4.metric("Wall Time", f"{max(r['duration'] for r in results)}s" if results else "—")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
