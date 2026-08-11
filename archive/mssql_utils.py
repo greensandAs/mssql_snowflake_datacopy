@@ -9,8 +9,8 @@ import snowflake.connector
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
-from mslogger import batch_create,log_update
-from mssf_utils import auditupdate,getcdcdates
+from archive.mslogger import batch_create,log_update
+from archive.mssf_utils import auditupdate,getcdcdates
 import threading
 from threading import Lock
 import shutil

@@ -87,8 +87,8 @@ st.markdown(f"""
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    if Path(LOGO_LIGHT).exists():
-        st.image(LOGO_LIGHT, width=140)
+    if Path(LOGO_DARK).exists():
+        st.image(LOGO_DARK, width=140)
     st.markdown("---")
     st.markdown("**MSSQL → Snowflake**\n\nData Migration Console")
     st.markdown("---")

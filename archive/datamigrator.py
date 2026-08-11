@@ -10,12 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 import threading
-from cloud_utils import cloud_upload,az_archive
+from archive.cloud_utils import cloud_upload,az_archive
 from threading import Lock
-from mslogger import batch_create,log_update
-from mssql_utils import msquery,mscount,bcp_export,split_file_into_chunks
-from mssql_utils import file_name_generator,getcolumnnames
-from mssf_utils import sfquery,create_table,create_stage,copycommand,getcdcdates,mergecommand,auditupdate,sfcount
+from archive.mslogger import batch_create,log_update
+from archive.mssql_utils import msquery,mscount,bcp_export,split_file_into_chunks
+from archive.mssql_utils import file_name_generator,getcolumnnames
+from archive.mssf_utils import sfquery,create_table,create_stage,copycommand,getcdcdates,mergecommand,auditupdate,sfcount
 # from msaws_utils import s3upload
 import multiprocessing
 import shutil

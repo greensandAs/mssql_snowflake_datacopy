@@ -1,4 +1,4 @@
-from mssf_utils import sfquery
+from archive.mssf_utils import sfquery
 from datetime import datetime, timedelta
  
 def batch_create(where_condition,execution_mode):
