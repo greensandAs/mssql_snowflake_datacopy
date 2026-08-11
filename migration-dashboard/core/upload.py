@@ -29,7 +29,8 @@ def upload_to_blob(local_files: list[Path], tgt_table: str) -> dict:
             uploaded += 1
             logs.append(f"Uploaded: {local_file.name}")
         else:
-            logs.append(f"FAILED: {local_file.name} — {proc.stderr[:200]}")
+            err_detail = proc.stderr.strip() or proc.stdout.strip()
+            logs.append(f"FAILED: {local_file.name} — {err_detail[:500]}")
             return {"returncode": 1, "uploaded_count": uploaded, "log": "\n".join(logs)}
 
     return {"returncode": 0, "uploaded_count": uploaded, "log": "\n".join(logs)}
