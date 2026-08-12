@@ -91,6 +91,32 @@ def get_column_names(database: str, schema: str, table: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+def get_column_metadata(database: str, schema: str, table: str) -> list[dict]:
+    """Get full column metadata from MSSQL INFORMATION_SCHEMA.
+
+    Returns list of dicts: {name, data_type, max_length, precision, scale, is_nullable}
+    """
+    rows = mssql_query(
+        database,
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
+        "NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION",
+        (schema, table),
+    )
+    return [
+        {
+            "name": r[0],
+            "data_type": r[1].lower(),
+            "max_length": r[2],
+            "precision": r[3],
+            "scale": r[4],
+            "is_nullable": r[5] == "YES",
+        }
+        for r in rows
+    ]
+
+
 # ─── BCP Export ───────────────────────────────────────────────────────────────
 
 def bcp_export(tbl: dict, filepath: Path, condition: str = "1=1") -> dict:

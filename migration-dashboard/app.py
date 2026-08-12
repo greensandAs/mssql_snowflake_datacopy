@@ -177,29 +177,51 @@ with tab_config:
         if "disc" in st.session_state and st.session_state["disc"]:
             disc = st.session_state["disc"]
             st.success(f"Found {len(disc)} table(s)")
-            st.dataframe(pd.DataFrame(disc), hide_index=True, use_container_width=True)
+
             existing = {(t.get("source_db"), t.get("source_table")) for t in tables}
-            new = [d for d in disc if (st.session_state["disc_db"], d["table"]) not in existing]
-            if new and st.button(f"➕ Add {len(new)} table(s)", key="d_add"):
-                for d in new:
-                    tables.append({
-                        "source_db": st.session_state["disc_db"],
-                        "source_schema": st.session_state["disc_sch"],
-                        "source_table": d["table"],
-                        "target_db": "ANALYTICS", "target_schema": "PUBLIC",
-                        "target_table": d["table"].upper(),
-                        "primary_key": d["pk"], "load_type": d["load"],
-                        "cdc_columns": d["wm"], "cdc_type": "TIMESTAMP",
-                        "scd_type": 0, "execution_mode": "FULL", "delimiter": "|",
-                        "filter_condition": None, "trim": "N", "encryption_columns": None,
-                        "custom_sql": None, "cloud_path": os.getenv("CLOUD_PATH", ""),
-                        "warehouse_name": os.getenv("SF_WAREHOUSE", "COMPUTE_WH"),
-                        "active": True, "last_run_status": None,
-                    })
-                cfg["tables"] = tables
-                save_config(cfg)
-                del st.session_state["disc"]
-                st.rerun()
+            new_tables = [d for d in disc if (st.session_state["disc_db"], d["table"]) not in existing]
+            already_added = [d for d in disc if (st.session_state["disc_db"], d["table"]) in existing]
+
+            if already_added:
+                st.caption(f"{len(already_added)} table(s) already in config (skipped)")
+
+            if new_tables:
+                st.markdown("**Select tables to onboard:**")
+                # Create selection checkboxes
+                select_all = st.checkbox("Select All", value=False, key="d_select_all")
+                selected = []
+                for i, d in enumerate(new_tables):
+                    load_hint = f"🔄 incremental ({d['pk']}, {d['wm']})" if d["load"] == "incremental" else "📦 full"
+                    checked = st.checkbox(
+                        f"**{d['table']}** — {load_hint}",
+                        value=select_all,
+                        key=f"d_chk_{i}",
+                    )
+                    if checked:
+                        selected.append(d)
+
+                if selected and st.button(f"➕ Add {len(selected)} selected table(s)", key="d_add"):
+                    for d in selected:
+                        tables.append({
+                            "source_db": st.session_state["disc_db"],
+                            "source_schema": st.session_state["disc_sch"],
+                            "source_table": d["table"],
+                            "target_db": "ANALYTICS", "target_schema": "PUBLIC",
+                            "target_table": d["table"].upper(),
+                            "primary_key": d["pk"], "load_type": d["load"],
+                            "cdc_columns": d["wm"], "cdc_type": "TIMESTAMP",
+                            "scd_type": 0, "execution_mode": "FULL", "delimiter": "|",
+                            "filter_condition": None, "trim": "N", "encryption_columns": None,
+                            "custom_sql": None, "cloud_path": os.getenv("CLOUD_PATH", ""),
+                            "warehouse_name": os.getenv("SF_WAREHOUSE", "COMPUTE_WH"),
+                            "active": True, "last_run_status": None,
+                        })
+                    cfg["tables"] = tables
+                    save_config(cfg)
+                    del st.session_state["disc"]
+                    st.rerun()
+            else:
+                st.info("All discovered tables are already in the config.")
 
     # ── Add Manually (Full Form) ──────────────────────────────────────────────
     with st.expander("➕ Add Table Manually"):

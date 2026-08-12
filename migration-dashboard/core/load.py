@@ -13,6 +13,122 @@ from __future__ import annotations
 import os
 
 from core.connections import sf_execute, sf_query
+from core.extract import get_column_metadata
+
+
+# ─── MSSQL → Snowflake Type Mapping ─────────────────────────────────────────
+
+MSSQL_TO_SF_TYPE = {
+    "int": "NUMBER(10,0)",
+    "bigint": "NUMBER(19,0)",
+    "smallint": "NUMBER(5,0)",
+    "tinyint": "NUMBER(3,0)",
+    "bit": "BOOLEAN",
+    "float": "FLOAT",
+    "real": "FLOAT",
+    "money": "NUMBER(19,4)",
+    "smallmoney": "NUMBER(10,4)",
+    "date": "DATE",
+    "time": "TIME",
+    "datetime": "TIMESTAMP_NTZ",
+    "datetime2": "TIMESTAMP_NTZ",
+    "smalldatetime": "TIMESTAMP_NTZ",
+    "datetimeoffset": "TIMESTAMP_TZ",
+    "uniqueidentifier": "VARCHAR(36)",
+    "text": "VARCHAR(16777216)",
+    "ntext": "VARCHAR(16777216)",
+    "image": "BINARY",
+    "xml": "VARIANT",
+}
+
+
+def _map_mssql_type(col: dict) -> str:
+    """Map a single MSSQL column to Snowflake data type."""
+    dt = col["data_type"]
+
+    # Direct mapping
+    if dt in MSSQL_TO_SF_TYPE:
+        return MSSQL_TO_SF_TYPE[dt]
+
+    # varchar/nvarchar/char/nchar with length
+    if dt in ("varchar", "nvarchar", "char", "nchar"):
+        length = col["max_length"]
+        if length and length > 0:
+            return f"VARCHAR({length})"
+        return "VARCHAR(16777216)"
+
+    # varbinary
+    if dt in ("varbinary", "binary"):
+        length = col["max_length"]
+        if length and length > 0:
+            return f"BINARY({length})"
+        return "BINARY"
+
+    # decimal/numeric with precision and scale
+    if dt in ("decimal", "numeric"):
+        p = col["precision"] or 38
+        s = col["scale"] or 0
+        return f"NUMBER({p},{s})"
+
+    # Fallback
+    return "VARCHAR(16777216)"
+
+
+def ensure_target_table(tbl: dict) -> str | None:
+    """Create target table from MSSQL schema if it doesn't exist.
+
+    Returns DDL string if created, None if already exists.
+    """
+    tgt_db = tbl.get("target_db", "ANALYTICS")
+    tgt_schema = tbl.get("target_schema", "PUBLIC")
+    tgt_table = tbl["target_table"]
+    tgt_fqn = f"{tgt_db}.{tgt_schema}.{tgt_table}"
+    scd_type = tbl.get("scd_type", 0)
+    primary_key = tbl.get("primary_key", "")
+    pk_list = [pk.strip().upper() for pk in primary_key.split(",")] if primary_key else []
+
+    # Check if table already exists
+    check_sql = (
+        f"SELECT COUNT(*) AS C FROM {tgt_db}.INFORMATION_SCHEMA.TABLES "
+        f"WHERE TABLE_SCHEMA='{tgt_schema}' AND TABLE_NAME='{tgt_table}'"
+    )
+    try:
+        df = sf_query(check_sql)
+        if df is not None and not df.empty and int(df.iloc[0]["C"]) > 0:
+            return None  # Already exists
+    except Exception:
+        pass
+
+    # Get MSSQL column metadata
+    src_db = tbl["source_db"]
+    src_schema = tbl.get("source_schema", "dbo")
+    src_table = tbl["source_table"]
+
+    columns = get_column_metadata(src_db, src_schema, src_table)
+    if not columns:
+        raise ValueError(f"No columns found for {src_db}.{src_schema}.{src_table}")
+
+    # Build CREATE TABLE DDL
+    col_defs = []
+    for col in columns:
+        sf_type = _map_mssql_type(col)
+        nullable = "" if col["is_nullable"] else " NOT NULL"
+        col_defs.append(f"    {col['name'].upper()} {sf_type}{nullable}")
+
+    # Add SCD2 metadata columns if configured
+    if scd_type == 2:
+        col_defs.append("    IS_CURRENT BOOLEAN DEFAULT TRUE")
+        col_defs.append("    EFF_START_DATE TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()")
+        col_defs.append("    EFF_END_DATE TIMESTAMP_NTZ")
+
+    cols_str = ",\n".join(col_defs)
+    ddl = f"CREATE TABLE IF NOT EXISTS {tgt_fqn} (\n{cols_str}\n)"
+
+    # Ensure schema exists
+    sf_execute(f"CREATE SCHEMA IF NOT EXISTS {tgt_db}.{tgt_schema}")
+    sf_execute(ddl)
+
+    return ddl
 
 
 SF_STAGE = os.getenv("SF_STAGE", "@DATA_MIGRATION.CONTROL.MIGRATION_STAGE")
@@ -336,6 +452,14 @@ def execute_load(tbl: dict) -> dict:
     pk_list = [pk.strip() for pk in primary_key.split(",")] if primary_key else []
 
     logs = []
+
+    # 0. Auto-create target table from MSSQL schema if it doesn't exist
+    try:
+        ddl = ensure_target_table(tbl)
+        if ddl:
+            logs.append(f"Created target table: {tgt_db}.{tgt_schema}.{tgt_table}")
+    except Exception as e:
+        return {"returncode": 1, "logs": [f"Target table creation failed: {e}"], "sf_count": 0}
 
     # 1. Check files exist
     file_count = check_files_in_stage(tgt_table)
