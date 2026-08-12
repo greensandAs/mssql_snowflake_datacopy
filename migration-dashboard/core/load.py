@@ -49,11 +49,15 @@ def check_files_in_stage(tgt_table: str) -> int:
         return -1
 
 
-def copy_into(target_fqn: str, tgt_table: str, delimiter: str = "|", compressed: bool = True) -> dict:
-    """COPY INTO target from stage. Returns {returncode, sql, log, rows_loaded}."""
+def copy_into(target_fqn: str, tgt_table: str, delimiter: str = "|", compressed: bool = True, columns: list[str] | None = None) -> dict:
+    """COPY INTO target from stage. Returns {returncode, sql, log, rows_loaded}.
+    
+    If columns is provided, only loads into those specific columns (positional match to CSV).
+    """
     compression = "COMPRESSION='GZIP'" if compressed else ""
+    col_clause = f" ({', '.join(columns)})" if columns else ""
     copy_sql = (
-        f"COPY INTO {target_fqn} FROM {SF_STAGE}/{tgt_table}/ "
+        f"COPY INTO {target_fqn}{col_clause} FROM {SF_STAGE}/{tgt_table}/ "
         f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='{delimiter}' "
         f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' NULL_IF=('NULL','') SKIP_HEADER=0 {compression}) "
         f"ON_ERROR='CONTINUE'"
@@ -164,9 +168,11 @@ def merge_scd1(tgt_db: str, tgt_schema: str, tgt_table: str, primary_keys: list[
         return {
             "returncode": 0, "sql": merge_sql,
             "log": f"SCD1 MERGE: {inserted} inserted, {updated} updated",
+            "rows_inserted": inserted, "rows_updated": updated, "rows_expired": 0,
         }
     except Exception as e:
-        return {"returncode": 1, "sql": merge_sql, "log": f"SCD1 MERGE FAILED: {e}"}
+        return {"returncode": 1, "sql": merge_sql, "log": f"SCD1 MERGE FAILED: {e}",
+                "rows_inserted": 0, "rows_updated": 0, "rows_expired": 0}
 
 
 # ─── MERGE: SCD Type 2 (History Tracking) ────────────────────────────────────
@@ -207,36 +213,60 @@ def merge_scd2(tgt_db: str, tgt_schema: str, tgt_table: str, primary_keys: list[
         f"NVL(TARGET.{c}::VARCHAR,'') <> NVL(SOURCE.{c}::VARCHAR,'')" for c in data_cols
     ) if data_cols else "1=0"
 
-    # Step 1: Expire changed rows
+    # Step 1: Expire changed rows using MERGE (avoids unsupported correlated subquery)
     expire_sql = (
-        f"UPDATE {tgt_fqn} AS TARGET SET "
-        f"TARGET.IS_CURRENT = FALSE, TARGET.EFF_END_DATE = CURRENT_TIMESTAMP() "
-        f"WHERE TARGET.IS_CURRENT = TRUE AND EXISTS ("
-        f"SELECT 1 FROM {wrk_fqn} AS SOURCE WHERE {on_clause} AND ({change_check}))"
+        f"MERGE INTO {tgt_fqn} AS TARGET "
+        f"USING {wrk_fqn} AS SOURCE ON {on_clause} AND TARGET.IS_CURRENT = TRUE "
+        f"WHEN MATCHED AND ({change_check}) THEN "
+        f"UPDATE SET TARGET.IS_CURRENT = FALSE, TARGET.EFF_END_DATE = CURRENT_TIMESTAMP()"
     )
 
-    # Step 2: Insert new versions (all rows from WRK that are new or changed)
+    # Step 2: Insert new versions — use LEFT JOIN to find new or changed rows
     all_cols_no_meta = [c for c in columns if c.upper() not in scd2_meta]
     insert_cols_str = ", ".join(all_cols_no_meta + ["IS_CURRENT", "EFF_START_DATE", "EFF_END_DATE"])
     source_vals = ", ".join(f"SOURCE.{c}" for c in all_cols_no_meta)
     insert_vals_str = f"{source_vals}, TRUE, CURRENT_TIMESTAMP(), NULL"
 
+    # Insert rows that are either new (no match) or changed (match with different data)
+    pk_join = " AND ".join(f"TARGET.{pk} = SOURCE.{pk}" for pk in primary_keys)
+    no_change_check = " AND ".join(
+        f"NVL(TARGET.{c}::VARCHAR,'') = NVL(SOURCE.{c}::VARCHAR,'')" for c in data_cols
+    ) if data_cols else "1=1"
+
     insert_sql = (
         f"INSERT INTO {tgt_fqn} ({insert_cols_str}) "
         f"SELECT {insert_vals_str} FROM {wrk_fqn} AS SOURCE "
-        f"WHERE NOT EXISTS ("
-        f"SELECT 1 FROM {tgt_fqn} AS TARGET "
-        f"WHERE {on_clause} AND TARGET.IS_CURRENT = TRUE "
-        f"AND NOT ({change_check}))"
+        f"LEFT JOIN {tgt_fqn} AS TARGET ON {pk_join} AND TARGET.IS_CURRENT = TRUE "
+        f"WHERE TARGET.{primary_keys[0]} IS NULL OR NOT ({no_change_check})"
     )
 
     try:
-        sf_execute(expire_sql)
+        expire_result = sf_query(expire_sql)
+        expired_count = 0
+        if expire_result is not None and not expire_result.empty:
+            for col in expire_result.columns:
+                if "updated" in col.lower():
+                    expired_count = int(expire_result[col].sum())
+                    break
+
         sf_execute(insert_sql)
+        # Count inserted rows (new versions)
+        wrk_count = 0
+        try:
+            cnt = sf_query(f"SELECT COUNT(*) AS C FROM {wrk_fqn}")
+            wrk_count = int(cnt.iloc[0]["C"])
+        except Exception:
+            pass
+
         full_sql = f"{expire_sql};\n{insert_sql}"
-        return {"returncode": 0, "sql": full_sql, "log": "SCD2: Expired old rows + inserted new versions"}
+        return {
+            "returncode": 0, "sql": full_sql,
+            "log": f"SCD2: {expired_count} expired, {wrk_count} inserted as new versions",
+            "rows_inserted": wrk_count, "rows_updated": 0, "rows_expired": expired_count,
+        }
     except Exception as e:
-        return {"returncode": 1, "sql": expire_sql, "log": f"SCD2 FAILED: {e}"}
+        return {"returncode": 1, "sql": f"{expire_sql};\n{insert_sql}", "log": f"SCD2 FAILED: {e}",
+                "rows_inserted": 0, "rows_updated": 0, "rows_expired": 0}
 
 
 # ─── FULL Load (Atomic SWAP) ─────────────────────────────────────────────────
@@ -313,18 +343,43 @@ def execute_load(tbl: dict) -> dict:
         return {"returncode": 1, "logs": ["No files found in stage — nothing to load"], "sf_count": 0}
     logs.append(f"Found {file_count} file(s) in stage")
 
-    # 2. Prepare work table
+    # 2. Prepare work table (TRUNCATE ensures clean slate — avoids loading stale data from prior runs)
     try:
         wrk_fqn = prepare_work_table(tgt_db, tgt_schema, tgt_table)
         logs.append(f"Work table ready: {wrk_fqn}")
     except Exception as e:
         return {"returncode": 1, "logs": [f"Work table creation failed: {e}"], "sf_count": 0}
 
-    # 3. COPY INTO work table
-    copy_result = copy_into(wrk_fqn, tgt_table, delimiter, compressed=True)
+    # 3. COPY INTO work table (exclude SCD2 metadata columns — they don't exist in source CSV)
+    all_columns = _get_columns(tgt_db, tgt_schema, tgt_table)
+    scd2_meta = {"IS_CURRENT", "EFF_START_DATE", "EFF_END_DATE"}
+    data_columns = [c for c in all_columns if c.upper() not in scd2_meta]
+    copy_result = copy_into(wrk_fqn, tgt_table, delimiter, compressed=True, columns=data_columns if len(data_columns) < len(all_columns) else None)
     logs.append(copy_result["log"])
     if copy_result["returncode"] != 0:
         return {"returncode": 1, "logs": logs, "sf_count": 0}
+
+    # 3b. Purge stage files after successful COPY to prevent reprocessing on failure retry
+    try:
+        sf_execute(f"REMOVE {SF_STAGE}/{tgt_table}/")
+        logs.append("Stage purged after COPY")
+    except Exception:
+        pass
+
+    # 3c. Deduplicate work table by PK (keeps latest row per key — prevents MERGE duplicate errors)
+    if pk_list:
+        pk_cols = ", ".join(pk_list)
+        dedup_sql = (
+            f"CREATE OR REPLACE TABLE {wrk_fqn} AS "
+            f"SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_cols} ORDER BY {pk_cols}) AS _rn "
+            f"FROM {wrk_fqn}) WHERE _rn = 1"
+        )
+        try:
+            sf_execute(dedup_sql)
+            # Drop the helper column
+            sf_execute(f"ALTER TABLE {wrk_fqn} DROP COLUMN _rn")
+        except Exception:
+            pass
 
     # 4. MERGE / INSERT based on load type + SCD type
     if load_type == "full":
@@ -345,10 +400,14 @@ def execute_load(tbl: dict) -> dict:
 
     logs.append(merge_result["log"])
 
-    # 5. Get final target count (accurate post-merge count)
+    # 5. Get final target count — only IS_CURRENT rows for SCD2 tables
     sf_count = 0
     try:
-        cnt = sf_query(f"SELECT COUNT(*) AS C FROM {tgt_db}.{tgt_schema}.{tgt_table}")
+        all_cols_upper = [c.upper() for c in _get_columns(tgt_db, tgt_schema, tgt_table)]
+        if "IS_CURRENT" in all_cols_upper:
+            cnt = sf_query(f"SELECT COUNT(*) AS C FROM {tgt_db}.{tgt_schema}.{tgt_table} WHERE IS_CURRENT = TRUE")
+        else:
+            cnt = sf_query(f"SELECT COUNT(*) AS C FROM {tgt_db}.{tgt_schema}.{tgt_table}")
         sf_count = int(cnt.iloc[0]["C"])
     except Exception:
         pass
@@ -359,4 +418,7 @@ def execute_load(tbl: dict) -> dict:
         "sf_count": sf_count,
         "rows_loaded": copy_result.get("rows_loaded", 0),
         "merge_sql": merge_result.get("sql", ""),
+        "rows_inserted": merge_result.get("rows_inserted", 0),
+        "rows_updated": merge_result.get("rows_updated", 0),
+        "rows_expired": merge_result.get("rows_expired", 0),
     }

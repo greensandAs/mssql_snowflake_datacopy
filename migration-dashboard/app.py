@@ -17,6 +17,11 @@ try:
 except ImportError:
     pass
 
+# Ensure azcopy is discoverable regardless of how Streamlit is launched
+_azcopy_dir = Path.home() / "Tools" / "azcopy"
+if _azcopy_dir.exists() and str(_azcopy_dir) not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(_azcopy_dir)
+
 # Ensure core/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
 from core.config import load_config, save_config, pull_from_snowflake
@@ -129,10 +134,11 @@ with tab_config:
             "Target": f"{t.get('target_db','')}.{t.get('target_schema','')}.{t.get('target_table')}",
             "Load": (t.get("load_type") or "full").upper(),
             "SCD": t.get("scd_type", 0),
-            "CDC": (t.get("cdc_type") or "—"),
+            "CDC Columns": t.get("cdc_columns") or "—",
+            "CDC Type": (t.get("cdc_type") or "—"),
             "PK": t.get("primary_key") or "—",
+            "Last Loaded": t.get("last_loaded_at") or "—",
             "Active": "✅" if t.get("active") else "❌",
-            "Status": t.get("last_run_status") or "—",
         } for t in tables]), hide_index=True, use_container_width=True)
 
     st.markdown("---")
@@ -357,9 +363,22 @@ with tab_run:
             for result in sorted(results, key=lambda r: r["table"]):
                 with st.container(border=True):
                     if result["status"] == "SUCCESS":
+                        # Build delta summary
+                        delta_parts = []
+                        if result.get("rows_extracted"):
+                            delta_parts.append(f"{result['rows_extracted']:,} extracted")
+                        if result.get("rows_inserted"):
+                            delta_parts.append(f"{result['rows_inserted']:,} inserted")
+                        if result.get("rows_updated"):
+                            delta_parts.append(f"{result['rows_updated']:,} updated")
+                        if result.get("rows_expired"):
+                            delta_parts.append(f"{result['rows_expired']:,} expired")
+                        delta_str = " · ".join(delta_parts) if delta_parts else "no changes"
+
                         st.markdown(
                             f"✅ **{result['table']}** — {result['duration']}s · "
-                            f"{result['row_count']:,} extracted · {result['sf_count']:,} in target"
+                            f"{delta_str} · "
+                            f"MSSQL: {result['row_count']:,} / SF: {result['sf_count']:,}"
                         )
                     else:
                         st.markdown(f"❌ **{result['table']}** — failed")
@@ -413,7 +432,9 @@ with tab_results:
         st.markdown("<br>", unsafe_allow_html=True)
         display_cols = ["BATCH_ID", "JOB_ID", "MSSQL_TABLE_NAME", "SF_TABLE_NAME",
                         "EXECUTION_MODE", "LOAD_TYPE", "FINAL_STATUS",
-                        "MSSQL_TABLE_COUNT", "SF_TABLE_COUNT", "JOB_DURATION"]
+                        "MSSQL_TABLE_COUNT", "SF_TABLE_COUNT",
+                        "ROWS_EXTRACTED", "ROWS_INSERTED", "ROWS_UPDATED", "ROWS_EXPIRED",
+                        "JOB_DURATION"]
         available = [c for c in display_cols if c in log_df.columns]
         st.dataframe(log_df[available], hide_index=True, use_container_width=True)
 # ─── Footer ──────────────────────────────────────────────────────────────────

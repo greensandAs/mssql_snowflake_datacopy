@@ -60,14 +60,20 @@ def update_export_filename(batch_id: int, job_id: int, filename: str, row_count:
 
 
 def finalize_job(batch_id: int, job_id: int, status: str, job_end: datetime,
-                 duration: int, row_count: int, sf_count: int):
+                 duration: int, row_count: int, sf_count: int,
+                 rows_extracted: int = 0, rows_inserted: int = 0,
+                 rows_updated: int = 0, rows_expired: int = 0):
     """Mark job as completed with final metrics."""
     sf_execute(
         "UPDATE DATA_MIGRATION.CONTROL.LOG_TABLE SET "
         "FINAL_STATUS=%s, JOB_END_TIME=%s, JOB_DURATION=%s, "
-        "MSSQL_TABLE_COUNT=%s, SF_TABLE_COUNT=%s, INGESTION_COMPLETED='YES' "
+        "MSSQL_TABLE_COUNT=%s, SF_TABLE_COUNT=%s, "
+        "ROWS_EXTRACTED=%s, ROWS_INSERTED=%s, ROWS_UPDATED=%s, ROWS_EXPIRED=%s, "
+        "INGESTION_COMPLETED='YES' "
         "WHERE BATCH_ID=%s AND JOB_ID=%s",
-        (status, job_end, duration, row_count, sf_count, batch_id, job_id),
+        (status, job_end, duration, row_count, sf_count,
+         rows_extracted, rows_inserted, rows_updated, rows_expired,
+         batch_id, job_id),
     )
 
 

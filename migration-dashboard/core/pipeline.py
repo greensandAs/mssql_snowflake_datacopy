@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import save_config
+from core.connections import mssql_count
 from core.extract import bcp_export, build_cdc_condition, split_and_gzip
 from core.load import execute_load
 from core.logger import (
@@ -43,6 +44,7 @@ def run_single_table(tbl: dict, mode: str, batch_id: int, job_id: int,
     logs = []
     row_count = 0
     sf_count = 0
+    load_result = None
 
     # Create log entry
     try:
@@ -137,16 +139,34 @@ def run_single_table(tbl: dict, mode: str, batch_id: int, job_id: int,
 
     # ── FINALIZE ──────────────────────────────────────────────────────────────
     _progress(1.0)
-    return _finalize(tbl, batch_id, job_id, job_start, "SUCCESS", row_count, sf_count, logs)
+
+    # Get actual MSSQL total count for accurate logging
+    try:
+        mssql_total = mssql_count(
+            tbl["source_db"],
+            tbl.get("source_schema", "dbo"),
+            tbl["source_table"],
+        )
+    except Exception:
+        mssql_total = row_count  # fallback to BCP count
+
+    return _finalize(tbl, batch_id, job_id, job_start, "SUCCESS", mssql_total, sf_count, logs,
+                     rows_extracted=row_count,
+                     rows_inserted=load_result.get("rows_inserted", 0) if load_result else 0,
+                     rows_updated=load_result.get("rows_updated", 0) if load_result else 0,
+                     rows_expired=load_result.get("rows_expired", 0) if load_result else 0)
 
 
-def _finalize(tbl, batch_id, job_id, job_start, status, row_count, sf_count, logs) -> dict:
+def _finalize(tbl, batch_id, job_id, job_start, status, row_count, sf_count, logs,
+              rows_extracted=0, rows_inserted=0, rows_updated=0, rows_expired=0) -> dict:
     """Finalize a job: update LOG_TABLE and config."""
     job_end = datetime.now(timezone.utc).replace(tzinfo=None)
     duration = int((job_end - job_start).total_seconds())
 
     try:
-        finalize_job(batch_id, job_id, status, job_end, duration, row_count, sf_count)
+        finalize_job(batch_id, job_id, status, job_end, duration, row_count, sf_count,
+                     rows_extracted=rows_extracted, rows_inserted=rows_inserted,
+                     rows_updated=rows_updated, rows_expired=rows_expired)
     except Exception:
         pass
 
@@ -160,6 +180,10 @@ def _finalize(tbl, batch_id, job_id, job_start, status, row_count, sf_count, log
         "duration": duration,
         "row_count": row_count,
         "sf_count": sf_count,
+        "rows_extracted": rows_extracted,
+        "rows_inserted": rows_inserted,
+        "rows_updated": rows_updated,
+        "rows_expired": rows_expired,
         "logs": logs,
     }
 
